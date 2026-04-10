@@ -11,6 +11,8 @@ from craftax.craftax_env import make_craftax_env_from_name
 
 import wandb
 from typing import NamedTuple
+import json
+import shutil
 
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
@@ -50,7 +52,7 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
-def make_train(config):
+def make_train(config, restored_params=None, start_update_step=0, num_updates_to_run=None):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -109,6 +111,9 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
+        # RESUME: overwrite freshly-init'd params with loaded ones (opt_state stays fresh)
+        if restored_params is not None:
+            train_state = train_state.replace(params=restored_params)
 
         # Exploration state
         ex_state = {
@@ -608,10 +613,13 @@ def make_train(config):
             obsv,
             ex_state,
             _rng,
-            0,
+            start_update_step,
+        )
+        n_to_scan = (
+            num_updates_to_run if num_updates_to_run is not None else config["NUM_UPDATES"]
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, None, n_to_scan
         )
         return {"runner_state": runner_state}  # , "info": metric}
 
@@ -621,8 +629,61 @@ def make_train(config):
 def run_ppo(config):
     config = {k.upper(): v for k, v in config.__dict__.items()}
 
+    # Cumulative target across all invocations
+    total_updates = (
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+
+    # === RESUME: load checkpoint if requested ===
+    restored_params = None
+    start_update_step = 0
+    wandb_run_id = None
+
+    checkpoint_dir = config.get("CHECKPOINT_DIR")
+    if checkpoint_dir and config.get("RESUME"):
+        meta_path = os.path.join(checkpoint_dir, "meta.json")
+        params_dir = os.path.join(checkpoint_dir, "params")
+        if os.path.exists(meta_path) and os.path.exists(params_dir):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            wandb_run_id = meta.get("wandb_run_id")
+            start_update_step = int(meta.get("update_step", 0))
+
+            ckpt_mgr = CheckpointManager(params_dir, PyTreeCheckpointer())
+            latest_step = ckpt_mgr.latest_step()
+            restored_params = ckpt_mgr.restore(latest_step)
+            print(
+                f"[resume] loaded checkpoint from {checkpoint_dir}: "
+                f"start_update_step={start_update_step}/{total_updates}, "
+                f"wandb_run_id={wandb_run_id}"
+            )
+        else:
+            print(f"[resume] no checkpoint at {checkpoint_dir}, starting fresh")
+
+    # === Early exit if already complete ===
+    if start_update_step >= total_updates:
+        print(
+            f"[done] training already complete "
+            f"({start_update_step}/{total_updates}), exiting."
+        )
+        return
+
+    # === Compute this-invocation budget ===
+    remaining_updates = total_updates - start_update_step
+    max_per_run = config.get("MAX_UPDATES_PER_RUN")
+    if max_per_run is not None and max_per_run > 0:
+        updates_this_run = min(int(max_per_run), remaining_updates)
+    else:
+        updates_this_run = remaining_updates
+    print(
+        f"[invocation] running {updates_this_run} updates "
+        f"({start_update_step} -> {start_update_step + updates_this_run} "
+        f"of {total_updates} total)"
+    )
+
+    # === wandb init (resume-aware) ===
     if config["USE_WANDB"]:
-        wandb.init(
+        wandb_init_kwargs = dict(
             project=config["WANDB_PROJECT"],
             entity=config["WANDB_ENTITY"],
             config=config,
@@ -631,38 +692,86 @@ def run_ppo(config):
             + str(int(config["TOTAL_TIMESTEPS"] // 1e6))
             + "M",
         )
+        if wandb_run_id:
+            wandb_init_kwargs["id"] = wandb_run_id
+            wandb_init_kwargs["resume"] = "allow"
+        wandb.init(**wandb_init_kwargs)
 
+    # === Train ===
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_REPEATS"])
 
-    train_jit = jax.jit(make_train(config))
+    train_jit = jax.jit(
+        make_train(
+            config,
+            restored_params=restored_params,
+            start_update_step=start_update_step,
+            num_updates_to_run=updates_this_run,
+        )
+    )
     train_vmap = jax.vmap(train_jit)
 
     t0 = time.time()
     out = train_vmap(rngs)
     t1 = time.time()
     print("Time to run experiment", t1 - t0)
-    print("SPS: ", config["TOTAL_TIMESTEPS"] / (t1 - t0))
+    timesteps_this_run = updates_this_run * config["NUM_STEPS"] * config["NUM_ENVS"]
+    print("SPS: ", timesteps_this_run / (t1 - t0))
 
-    if config["USE_WANDB"]:
+    new_update_step = start_update_step + updates_this_run
 
-        def _save_network(rs_index, dir_name):
-            train_states = out["runner_state"][rs_index]
-            train_state = jax.tree.map(lambda x: x[0], train_states)
-            orbax_checkpointer = PyTreeCheckpointer()
-            options = CheckpointManagerOptions(max_to_keep=1, create=True)
-            path = os.path.join(wandb.run.dir, dir_name)
-            checkpoint_manager = CheckpointManager(path, orbax_checkpointer, options)
-            print(f"saved runner state to {path}")
-            save_args = orbax_utils.save_args_from_target(train_state)
-            checkpoint_manager.save(
-                config["TOTAL_TIMESTEPS"],
-                train_state,
-                save_kwargs={"save_args": save_args},
-            )
+    # === Save checkpoint (if checkpoint_dir set) ===
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-        if config["SAVE_POLICY"]:
-            _save_network(0, "policies")
+        # Extract params from first repeat
+        train_states = out["runner_state"][0]
+        train_state_first_repeat = jax.tree.map(lambda x: x[0], train_states)
+        params_to_save = train_state_first_repeat.params
+
+        params_dir = os.path.join(checkpoint_dir, "params")
+        # CheckpointManager with max_to_keep=1 will replace older saves automatically,
+        # but to be safe with re-runs we wipe the dir if it already exists
+        if os.path.exists(params_dir):
+            shutil.rmtree(params_dir)
+
+        save_options = CheckpointManagerOptions(max_to_keep=1, create=True)
+        ckpt_mgr = CheckpointManager(params_dir, PyTreeCheckpointer(), save_options)
+        save_args = orbax_utils.save_args_from_target(params_to_save)
+        ckpt_mgr.save(
+            new_update_step,
+            params_to_save,
+            save_kwargs={"save_args": save_args},
+        )
+
+        meta = {
+            "update_step": int(new_update_step),
+            "total_updates": int(total_updates),
+            "wandb_run_id": wandb.run.id if config["USE_WANDB"] else None,
+        }
+        with open(os.path.join(checkpoint_dir, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+        print(
+            f"[checkpoint] saved {new_update_step}/{total_updates} updates "
+            f"to {checkpoint_dir}"
+        )
+
+    # === Legacy: also keep --save_policy path (saves final policy to wandb dir) ===
+    if config["USE_WANDB"] and config["SAVE_POLICY"]:
+        train_states = out["runner_state"][0]
+        train_state = jax.tree.map(lambda x: x[0], train_states)
+        legacy_orbax = PyTreeCheckpointer()
+        legacy_options = CheckpointManagerOptions(max_to_keep=1, create=True)
+        legacy_path = os.path.join(wandb.run.dir, "policies")
+        legacy_mgr = CheckpointManager(legacy_path, legacy_orbax, legacy_options)
+        print(f"saved runner state to {legacy_path}")
+        legacy_save_args = orbax_utils.save_args_from_target(train_state)
+        legacy_mgr.save(
+            config["TOTAL_TIMESTEPS"],
+            train_state,
+            save_kwargs={"save_args": legacy_save_args},
+        )
 
 
 if __name__ == "__main__":
@@ -697,6 +806,27 @@ if __name__ == "__main__":
         "--use_wandb", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--save_policy", action="store_true")
+    # === Resume / checkpoint flags ===
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Directory to save checkpoint to (and load from if --resume). "
+        "If not set, no per-invocation checkpointing happens.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="If --checkpoint_dir contains a checkpoint, load it and continue training.",
+    )
+    parser.add_argument(
+        "--max_updates_per_run",
+        type=int,
+        default=None,
+        help="Max number of update steps to run in this Python invocation. "
+        "Used to chunk a long training across multiple Slurm jobs. "
+        "If not set, run all remaining updates this invocation.",
+    )
     parser.add_argument("--num_repeats", type=int, default=1)
     parser.add_argument("--layer_size", type=int, default=512)
     parser.add_argument("--wandb_project", type=str)
