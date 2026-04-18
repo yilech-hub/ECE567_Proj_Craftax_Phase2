@@ -52,7 +52,7 @@ class Transition(NamedTuple):
     info: jnp.ndarray
 
 
-def make_train(config, restored_params=None, start_update_step=0, num_updates_to_run=None):
+def make_train(config, checkpoint_dir=None, resume=False, start_update_step=0, num_updates_to_run=None):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -84,6 +84,46 @@ def make_train(config, restored_params=None, start_update_step=0, num_updates_to
         )
         return config["LR"] * frac
 
+    # === RESUME: build concrete restore target via dummy init, then load checkpoint. ===
+    # orbax needs concrete arrays (for sharding info), so this must happen here in
+    # make_train's outer scope — NOT inside train() where params are tracers.
+    restored_train_state_dict = None
+    if resume and checkpoint_dir:
+        params_dir = os.path.join(checkpoint_dir, "params")
+        if os.path.exists(params_dir):
+            if "Symbolic" in config["ENV_NAME"]:
+                _network = ActorCritic(
+                    env.action_space(env_params).n, config["LAYER_SIZE"]
+                )
+            else:
+                _network = ActorCriticConv(
+                    env.action_space(env_params).n, config["LAYER_SIZE"]
+                )
+            _init_x = jnp.zeros((1, *env.observation_space(env_params).shape))
+            _dummy_params = _network.init(jax.random.PRNGKey(0), _init_x)
+            if config["ANNEAL_LR"]:
+                _tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                )
+            else:
+                _tx = optax.chain(
+                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                    optax.adam(config["LR"], eps=1e-5),
+                )
+            _target_ts = TrainState.create(
+                apply_fn=_network.apply, params=_dummy_params, tx=_tx
+            )
+            target = {
+                "params": _target_ts.params,
+                "opt_state": _target_ts.opt_state,
+                "step": _target_ts.step,
+            }
+            resume_mgr = CheckpointManager(params_dir, PyTreeCheckpointer())
+            restored_train_state_dict = resume_mgr.restore(
+                resume_mgr.latest_step(), items=target
+            )
+
     def train(rng):
         # INIT NETWORK
         if "Symbolic" in config["ENV_NAME"]:
@@ -111,9 +151,14 @@ def make_train(config, restored_params=None, start_update_step=0, num_updates_to
             params=network_params,
             tx=tx,
         )
-        # RESUME: overwrite freshly-init'd params with loaded ones (opt_state stays fresh)
-        if restored_params is not None:
-            train_state = train_state.replace(params=restored_params)
+        # RESUME: overwrite freshly-init'd train_state with loaded checkpoint.
+        # restored_train_state_dict is loaded in make_train's outer scope (above).
+        if restored_train_state_dict is not None:
+            train_state = train_state.replace(
+                params=restored_train_state_dict["params"],
+                opt_state=restored_train_state_dict["opt_state"],
+                step=restored_train_state_dict["step"],
+            )
 
         # Exploration state
         ex_state = {
@@ -634,13 +679,13 @@ def run_ppo(config):
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
 
-    # === RESUME: load checkpoint if requested ===
-    restored_params = None
+    # === RESUME: read meta.json here; params/opt_state loaded inside make_train ===
     start_update_step = 0
     wandb_run_id = None
 
     checkpoint_dir = config.get("CHECKPOINT_DIR")
-    if checkpoint_dir and config.get("RESUME"):
+    resume = bool(config.get("RESUME"))
+    if checkpoint_dir and resume:
         meta_path = os.path.join(checkpoint_dir, "meta.json")
         params_dir = os.path.join(checkpoint_dir, "params")
         if os.path.exists(meta_path) and os.path.exists(params_dir):
@@ -648,17 +693,14 @@ def run_ppo(config):
                 meta = json.load(f)
             wandb_run_id = meta.get("wandb_run_id")
             start_update_step = int(meta.get("update_step", 0))
-
-            ckpt_mgr = CheckpointManager(params_dir, PyTreeCheckpointer())
-            latest_step = ckpt_mgr.latest_step()
-            restored_params = ckpt_mgr.restore(latest_step)
             print(
-                f"[resume] loaded checkpoint from {checkpoint_dir}: "
+                f"[resume] will load checkpoint from {checkpoint_dir}: "
                 f"start_update_step={start_update_step}/{total_updates}, "
                 f"wandb_run_id={wandb_run_id}"
             )
         else:
             print(f"[resume] no checkpoint at {checkpoint_dir}, starting fresh")
+            resume = False
 
     # === Early exit if already complete ===
     if start_update_step >= total_updates:
@@ -704,7 +746,8 @@ def run_ppo(config):
     train_jit = jax.jit(
         make_train(
             config,
-            restored_params=restored_params,
+            checkpoint_dir=checkpoint_dir,
+            resume=resume,
             start_update_step=start_update_step,
             num_updates_to_run=updates_this_run,
         )
@@ -724,10 +767,14 @@ def run_ppo(config):
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # Extract params from first repeat
+        # Extract full train_state from first repeat (params + opt_state + step)
         train_states = out["runner_state"][0]
         train_state_first_repeat = jax.tree.map(lambda x: x[0], train_states)
-        params_to_save = train_state_first_repeat.params
+        to_save = {
+            "params": train_state_first_repeat.params,
+            "opt_state": train_state_first_repeat.opt_state,
+            "step": train_state_first_repeat.step,
+        }
 
         params_dir = os.path.join(checkpoint_dir, "params")
         # CheckpointManager with max_to_keep=1 will replace older saves automatically,
@@ -737,10 +784,10 @@ def run_ppo(config):
 
         save_options = CheckpointManagerOptions(max_to_keep=1, create=True)
         ckpt_mgr = CheckpointManager(params_dir, PyTreeCheckpointer(), save_options)
-        save_args = orbax_utils.save_args_from_target(params_to_save)
+        save_args = orbax_utils.save_args_from_target(to_save)
         ckpt_mgr.save(
             new_update_step,
-            params_to_save,
+            to_save,
             save_kwargs={"save_args": save_args},
         )
 
