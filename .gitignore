@@ -1,0 +1,14 @@
+# wandb local artifacts (don't bloat the repo)
+Exploration/wandb/
+Exploration/logz/__pycache__/
+Exploration/models/__pycache__/
+Exploration/__pycache__/
+__pycache__/
+*.pyc
+
+# local training artifacts
+checkpoints/
+*.orbax_checkpoint/
+
+# OS
+.DS_Store
